@@ -47,12 +47,22 @@ const notFoundAlbums = [];
 
 // Track stats by genre
 const genreStats = {
-  BASS: { processed: 0, added: 0, notFound: 0 },
-  TECHNO: { processed: 0, added: 0, notFound: 0 },
-  HOUSE: { processed: 0, added: 0, notFound: 0 },
-  DNB: { processed: 0, added: 0, notFound: 0 },
-  AMBIENT: { processed: 0, added: 0, notFound: 0 },
-  REST: { processed: 0, added: 0, notFound: 0 }
+  BASS: { processed: 0, added: 0, notFound: 0, skipped: 0 },
+  TECHNO: { processed: 0, added: 0, notFound: 0, skipped: 0 },
+  HOUSE: { processed: 0, added: 0, notFound: 0, skipped: 0 },
+  DNB: { processed: 0, added: 0, notFound: 0, skipped: 0 },
+  AMBIENT: { processed: 0, added: 0, notFound: 0, skipped: 0 },
+  REST: { processed: 0, added: 0, notFound: 0, skipped: 0 }
+};
+
+// Store existing track URIs for each playlist
+const existingPlaylistTracks = {
+  BASS: new Set(),
+  TECHNO: new Set(),
+  HOUSE: new Set(),
+  DNB: new Set(),
+  AMBIENT: new Set(),
+  REST: new Set()
 };
 
 // Delay helper to avoid rate limiting
@@ -227,6 +237,62 @@ function setupAuthServer() {
   });
 }
 
+// Fetch all existing tracks from a playlist
+async function fetchPlaylistTracks(playlistId, playlistName) {
+  try {
+    const token = await getAccessToken();
+    const allTracks = new Set();
+    let offset = 0;
+    const limit = 100;
+    let total = 0;
+    
+    console.log(`   Fetching existing tracks from ${playlistName} playlist...`);
+    
+    do {
+      const url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?offset=${offset}&limit=${limit}&fields=items(track(uri)),total`;
+      
+      const response = await axios.get(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      
+      total = response.data.total;
+      
+      response.data.items.forEach(item => {
+        if (item.track && item.track.uri) {
+          allTracks.add(item.track.uri);
+        }
+      });
+      
+      offset += limit;
+      await delay(200); // Rate limiting delay
+      
+    } while (offset < total);
+    
+    console.log(`   ✓ Found ${allTracks.size} existing tracks in ${playlistName}`);
+    return allTracks;
+    
+  } catch (error) {
+    console.error(`   ✗ Error fetching tracks from ${playlistName}:`, error.message);
+    return new Set();
+  }
+}
+
+// Fetch all existing tracks from all playlists
+async function fetchAllPlaylistTracks() {
+  console.log('\n🔍 Fetching existing tracks from all playlists...');
+  
+  for (const [genre, playlistId] of Object.entries(PLAYLISTS)) {
+    if (playlistId && !playlistId.startsWith('YOUR_')) {
+      const tracks = await fetchPlaylistTracks(playlistId, genre);
+      existingPlaylistTracks[genre] = tracks;
+    }
+  }
+  
+  console.log('✅ Finished fetching existing tracks\n');
+}
+
 // Determine playlist based on tags
 function determinePlaylist(tags) {
   if (!tags || tags.length === 0) {
@@ -243,7 +309,7 @@ function determinePlaylist(tags) {
   }
   
   // Priority 2: Check Techno, House, Bass in order
-  for (const genre of ['TECHNO', 'HOUSE', 'BASS']) {
+  for (const genre of ['BASS', 'HOUSE', 'TECHNO']) {
     if (GENRE_MAPPINGS[genre].some(keyword => 
       tagsLower.some(tag => tag === keyword.toLowerCase())
     )) {
@@ -351,7 +417,7 @@ async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
 }
 
 // Get all tracks from an album
-async function getAlbumTracks(albumId) {
+async function getAlbumTracks(albumId, playlistGenre) {
   try {
     const token = await getAccessToken();
     const url = `https://api.spotify.com/v1/albums/${albumId}/tracks`;
@@ -362,19 +428,30 @@ async function getAlbumTracks(albumId) {
       }
     });
     
-    const trackUris = response.data.items.map(item => item.uri);
-    console.log(`   ✓ Got ${trackUris.length} tracks from album`);
-    return trackUris;
+    const allTrackUris = response.data.items.map(item => item.uri);
+    
+    // Filter out tracks that already exist in the playlist
+    const existingTracks = existingPlaylistTracks[playlistGenre];
+    const newTrackUris = allTrackUris.filter(uri => !existingTracks.has(uri));
+    
+    if (newTrackUris.length < allTrackUris.length) {
+      const skippedCount = allTrackUris.length - newTrackUris.length;
+      console.log(`   ✓ Got ${allTrackUris.length} tracks from album (${skippedCount} already in playlist, ${newTrackUris.length} new)`);
+    } else {
+      console.log(`   ✓ Got ${newTrackUris.length} tracks from album (all new)`);
+    }
+    
+    return { allTracks: allTrackUris, newTracks: newTrackUris };
   } catch (error) {
     console.error(`   ✗ Error getting tracks for album ${albumId}:`, error.message);
-    return [];
+    return { allTracks: [], newTracks: [] };
   }
 }
 
 // Add tracks to Spotify playlist
 async function addTracksToPlaylist(trackUris, playlistId, playlistName) {
   if (trackUris.length === 0) {
-    return;
+    return 0;
   }
   
   try {
@@ -398,11 +475,17 @@ async function addTracksToPlaylist(trackUris, playlistId, playlistName) {
         }
       });
       
+      // Add to our tracking set
+      chunk.forEach(uri => existingPlaylistTracks[playlistName].add(uri));
+      
       console.log(`   ✓ Added ${chunk.length} tracks to ${playlistName} playlist`);
       await delay(500); // Small delay between requests
     }
+    
+    return trackUris.length;
   } catch (error) {
     console.error(`   ✗ Error adding tracks to ${playlistName} playlist:`, error.message);
+    return 0;
   }
 }
 
@@ -465,9 +548,13 @@ async function main() {
     await setupAuthServer();
   }
   
+  // Fetch existing tracks from all playlists
+  await fetchAllPlaylistTracks();
+  
   let totalProcessed = 0;
   let totalAdded = 0;
   let totalNotFound = 0;
+  let totalSkipped = 0;
   
   // Iterate through pages
   for (let page = START_PAGE; page <= END_PAGE; page++) {
@@ -493,18 +580,25 @@ async function main() {
       }
       
       // Step 2: Get all tracks from the album
-      const trackUris = await getAlbumTracks(albumId);
+      const { allTracks, newTracks } = await getAlbumTracks(albumId, playlist);
       await delay(300); // Rate limiting delay
       
-      if (trackUris.length === 0) {
+      const skippedCount = allTracks.length - newTracks.length;
+      if (skippedCount > 0) {
+        totalSkipped += skippedCount;
+        genreStats[playlist].skipped += skippedCount;
+      }
+      
+      if (newTracks.length === 0) {
+        console.log(`   ⊘ All tracks already in playlist, skipping`);
         continue;
       }
       
       // Step 3: Add tracks to the appropriate playlist
       const playlistId = PLAYLISTS[playlist];
-      await addTracksToPlaylist(trackUris, playlistId, playlist);
-      totalAdded += trackUris.length;
-      genreStats[playlist].added += trackUris.length;
+      const addedCount = await addTracksToPlaylist(newTracks, playlistId, playlist);
+      totalAdded += addedCount;
+      genreStats[playlist].added += addedCount;
       await delay(500); // Rate limiting delay
     }
     
@@ -524,10 +618,11 @@ async function main() {
   console.log(`   Total albums processed: ${totalProcessed}`);
   console.log(`   Total albums not found: ${totalNotFound}`);
   console.log(`   Total tracks added: ${totalAdded}`);
+  console.log(`   Total tracks skipped (duplicates): ${totalSkipped}`);
   console.log('\n📊 Breakdown by genre:');
   for (const [genre, stats] of Object.entries(genreStats)) {
     if (stats.processed > 0) {
-      console.log(`   ${genre.padEnd(10)} - Processed: ${stats.processed}, Added: ${stats.added} tracks, Not found: ${stats.notFound}`);
+      console.log(`   ${genre.padEnd(10)} - Processed: ${stats.processed}, Added: ${stats.added} tracks, Skipped: ${stats.skipped}, Not found: ${stats.notFound}`);
     }
   }
   console.log('='.repeat(70));

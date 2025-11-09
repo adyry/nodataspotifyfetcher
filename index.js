@@ -15,9 +15,27 @@ const __dirname = dirname(__filename);
 const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || 'YOUR_CLIENT_ID';
 const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
 const REDIRECT_URI = 'http://localhost:3000/callback';
-const PLAYLIST_ID = process.env.SPOTIFY_PLAYLIST_ID || 'YOUR_PLAYLIST_ID';
 const START_PAGE = 1;
 const END_PAGE = 26;
+
+// Playlist IDs by genre
+const PLAYLISTS = {
+  BASS: process.env.SPOTIFY_PLAYLIST_BASS || 'YOUR_BASS_PLAYLIST_ID',
+  TECHNO: process.env.SPOTIFY_PLAYLIST_TECHNO || 'YOUR_TECHNO_PLAYLIST_ID',
+  HOUSE: process.env.SPOTIFY_PLAYLIST_HOUSE || 'YOUR_HOUSE_PLAYLIST_ID',
+  DNB: process.env.SPOTIFY_PLAYLIST_DNB || 'YOUR_DNB_PLAYLIST_ID',
+  AMBIENT: process.env.SPOTIFY_PLAYLIST_AMBIENT || 'YOUR_AMBIENT_PLAYLIST_ID',
+  REST: process.env.SPOTIFY_PLAYLIST_REST || 'YOUR_REST_PLAYLIST_ID'
+};
+
+// Genre tag mappings
+const GENRE_MAPPINGS = {
+  BASS: ['Breaks', 'Dubstep', 'Bass'],
+  TECHNO: ['Techno'],
+  HOUSE: ['House'],
+  DNB: ['Drum n Bass', 'Jungle', 'Hardcore'],
+  AMBIENT: ['Ambient']
+};
 
 // Token storage
 let accessToken = null;
@@ -26,6 +44,16 @@ let tokenExpiryTime = null;
 
 // Track not found albums
 const notFoundAlbums = [];
+
+// Track stats by genre
+const genreStats = {
+  BASS: { processed: 0, added: 0, notFound: 0 },
+  TECHNO: { processed: 0, added: 0, notFound: 0 },
+  HOUSE: { processed: 0, added: 0, notFound: 0 },
+  DNB: { processed: 0, added: 0, notFound: 0 },
+  AMBIENT: { processed: 0, added: 0, notFound: 0 },
+  REST: { processed: 0, added: 0, notFound: 0 }
+};
 
 // Delay helper to avoid rate limiting
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -199,6 +227,40 @@ function setupAuthServer() {
   });
 }
 
+// Determine playlist based on tags
+function determinePlaylist(tags) {
+  if (!tags || tags.length === 0) {
+    return 'REST';
+  }
+
+  const tagsLower = tags.map(tag => tag.toLowerCase().trim());
+  
+  // Priority 1: DNB - if ANY DNB tag is present, it takes priority
+  if (GENRE_MAPPINGS.DNB.some(keyword => 
+    tagsLower.some(tag => tag === keyword.toLowerCase())
+  )) {
+    return 'DNB';
+  }
+  
+  // Priority 2: Check Techno, House, Bass in order
+  for (const genre of ['TECHNO', 'HOUSE', 'BASS']) {
+    if (GENRE_MAPPINGS[genre].some(keyword => 
+      tagsLower.some(tag => tag === keyword.toLowerCase())
+    )) {
+      return genre;
+    }
+  }
+  
+  // Priority 3: Ambient - only if no other main genres are present
+  if (GENRE_MAPPINGS.AMBIENT.some(keyword => 
+    tagsLower.some(tag => tag === keyword.toLowerCase())
+  )) {
+    return 'AMBIENT';
+  }
+
+  return 'REST';
+}
+
 // Fetch albums from a nodata.tv page
 async function fetchAlbumsFromPage(pageNumber) {
   try {
@@ -209,14 +271,26 @@ async function fetchAlbumsFromPage(pageNumber) {
     const $ = cheerio.load(response.data);
     
     const albums = [];
-    $('.column-13 .object > a').each((index, element) => {
-      const text = $(element).text().replace(/\[....\]/g, '').split('/ ');
-      const href = $(element).attr('href');
+    $('.project-box .object').each((index, element) => {
+      // Get album info from nested anchor
+      const albumLink = $(element).find('> a').first();
+      const text = albumLink.text().replace(/\[....\]/g, '').split('/ ');
+      const href = albumLink.attr('href');
+      
+      // Get tags
+      const tags = [];
+      $(element).find('a[rel="category tag"]').each((i, tagEl) => {
+        tags.push($(tagEl).text().trim());
+      });
+      
       if (text.length === 2) {
+        const playlist = determinePlaylist(tags);
         albums.push({
           artist: text[0].trim(),
           album: text[1].trim(),
-          url: href
+          url: href,
+          tags: tags,
+          playlist: playlist
         });
       }
     });
@@ -230,7 +304,7 @@ async function fetchAlbumsFromPage(pageNumber) {
 }
 
 // Search for album on Spotify
-async function searchSpotifyAlbum(artist, album, nodataUrl) {
+async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
   try {
     const token = await getAccessToken();
     const query = `artist:${artist} album:${album}`;
@@ -252,7 +326,9 @@ async function searchSpotifyAlbum(artist, album, nodataUrl) {
       notFoundAlbums.push({
         artist,
         album,
-        url: nodataUrl
+        url: nodataUrl,
+        tags,
+        playlist
       });
       return null;
     }
@@ -266,7 +342,9 @@ async function searchSpotifyAlbum(artist, album, nodataUrl) {
     notFoundAlbums.push({
       artist,
       album,
-      url: nodataUrl
+      url: nodataUrl,
+      tags,
+      playlist
     });
     return null;
   }
@@ -294,7 +372,7 @@ async function getAlbumTracks(albumId) {
 }
 
 // Add tracks to Spotify playlist
-async function addTracksToPlaylist(trackUris) {
+async function addTracksToPlaylist(trackUris, playlistId, playlistName) {
   if (trackUris.length === 0) {
     return;
   }
@@ -308,7 +386,7 @@ async function addTracksToPlaylist(trackUris) {
     
     for (const chunk of chunks) {
       const token = await getAccessToken();
-      const url = `https://api.spotify.com/v1/playlists/${PLAYLIST_ID}/tracks`;
+      const url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks`;
       
       await axios.post(url, {
         uris: chunk,
@@ -320,11 +398,11 @@ async function addTracksToPlaylist(trackUris) {
         }
       });
       
-      console.log(`   ✓ Added ${chunk.length} tracks to playlist`);
+      console.log(`   ✓ Added ${chunk.length} tracks to ${playlistName} playlist`);
       await delay(500); // Small delay between requests
     }
   } catch (error) {
-    console.error(`   ✗ Error adding tracks to playlist:`, error.message);
+    console.error(`   ✗ Error adding tracks to ${playlistName} playlist:`, error.message);
   }
 }
 
@@ -343,9 +421,24 @@ function saveNotFoundAlbums() {
   content += `Total: ${notFoundAlbums.length} albums\n\n`;
   content += `---\n\n`;
 
-  notFoundAlbums.forEach((album, index) => {
-    content += `${index + 1}. [${album.artist} - ${album.album}](${album.url})\n`;
+  // Group by playlist
+  const byPlaylist = {};
+  notFoundAlbums.forEach(album => {
+    if (!byPlaylist[album.playlist]) {
+      byPlaylist[album.playlist] = [];
+    }
+    byPlaylist[album.playlist].push(album);
   });
+
+  // Output by genre
+  for (const [playlist, albums] of Object.entries(byPlaylist).sort()) {
+    content += `## ${playlist} (${albums.length} albums)\n\n`;
+    albums.forEach((album, index) => {
+      const tagsStr = album.tags && album.tags.length > 0 ? ` *[${album.tags.join(', ')}]*` : '';
+      content += `${index + 1}. [${album.artist} - ${album.album}](${album.url})${tagsStr}\n`;
+    });
+    content += `\n`;
+  }
 
   try {
     writeFileSync(filepath, content, 'utf-8');
@@ -357,9 +450,15 @@ function saveNotFoundAlbums() {
 
 // Main function
 async function main() {
-  console.log('🎵 Starting NoData.tv to Spotify automation');
+  console.log('🎵 Starting NoData.tv to Spotify automation (Multi-Genre)');
   console.log(`   Pages: ${START_PAGE} to ${END_PAGE}`);
-  console.log(`   Playlist ID: ${PLAYLIST_ID}\n`);
+  console.log(`   Playlists configured:`);
+  console.log(`     - Bass: ${PLAYLISTS.BASS}`);
+  console.log(`     - Techno: ${PLAYLISTS.TECHNO}`);
+  console.log(`     - House: ${PLAYLISTS.HOUSE}`);
+  console.log(`     - Drum'n'Bass: ${PLAYLISTS.DNB}`);
+  console.log(`     - Ambient: ${PLAYLISTS.AMBIENT}`);
+  console.log(`     - Rest: ${PLAYLISTS.REST}\n`);
   
   // Authenticate first
   if (!accessToken) {
@@ -375,16 +474,21 @@ async function main() {
     const albums = await fetchAlbumsFromPage(page);
     
     // Process each album
-    for (const { artist, album, url } of albums) {
+    for (const { artist, album, url, tags, playlist } of albums) {
       totalProcessed++;
-      console.log(`\n[${totalProcessed}] Processing: "${album}" by ${artist}`);
+      genreStats[playlist].processed++;
+      
+      const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : ' [no tags]';
+      console.log(`\n[${totalProcessed}] Processing: "${album}" by ${artist}${tagsStr}`);
+      console.log(`   → Destination: ${playlist} playlist`);
       
       // Step 1: Search for album on Spotify
-      const albumId = await searchSpotifyAlbum(artist, album, url);
+      const albumId = await searchSpotifyAlbum(artist, album, url, tags, playlist);
       await delay(300); // Rate limiting delay
       
       if (!albumId) {
         totalNotFound++;
+        genreStats[playlist].notFound++;
         continue;
       }
       
@@ -396,9 +500,11 @@ async function main() {
         continue;
       }
       
-      // Step 3: Add tracks to playlist
-      await addTracksToPlaylist(trackUris);
+      // Step 3: Add tracks to the appropriate playlist
+      const playlistId = PLAYLISTS[playlist];
+      await addTracksToPlaylist(trackUris, playlistId, playlist);
       totalAdded += trackUris.length;
+      genreStats[playlist].added += trackUris.length;
       await delay(500); // Rate limiting delay
     }
     
@@ -412,12 +518,19 @@ async function main() {
   }
   
   // Final summary
-  console.log('\n' + '='.repeat(50));
+  console.log('\n' + '='.repeat(70));
   console.log('🎉 Automation completed!');
+  console.log('='.repeat(70));
   console.log(`   Total albums processed: ${totalProcessed}`);
   console.log(`   Total albums not found: ${totalNotFound}`);
-  console.log(`   Total tracks added to playlist: ${totalAdded}`);
-  console.log('='.repeat(50));
+  console.log(`   Total tracks added: ${totalAdded}`);
+  console.log('\n📊 Breakdown by genre:');
+  for (const [genre, stats] of Object.entries(genreStats)) {
+    if (stats.processed > 0) {
+      console.log(`   ${genre.padEnd(10)} - Processed: ${stats.processed}, Added: ${stats.added} tracks, Not found: ${stats.notFound}`);
+    }
+  }
+  console.log('='.repeat(70));
 }
 
 // Run the script

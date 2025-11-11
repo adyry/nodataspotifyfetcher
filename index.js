@@ -16,7 +16,7 @@ const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || 'YOUR_CLIENT_ID';
 const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
 const REDIRECT_URI = 'http://localhost:3000/callback';
 const START_PAGE = 1;
-const END_PAGE = 26;
+const END_PAGE = 316;
 
 // Playlist IDs by genre
 const PLAYLISTS = {
@@ -556,12 +556,12 @@ async function main() {
   let totalNotFound = 0;
   let totalSkipped = 0;
   
-  // Iterate through pages
-  for (let page = START_PAGE; page <= END_PAGE; page++) {
+  // Iterate through pages in reverse order
+  for (let page = END_PAGE; page >= START_PAGE; page--) {
     const albums = await fetchAlbumsFromPage(page);
     
-    // Process each album
-    for (const { artist, album, url, tags, playlist } of albums) {
+    // Process each album in reverse order
+    for (const { artist, album, url, tags, playlist } of albums.reverse()) {
       totalProcessed++;
       genreStats[playlist].processed++;
       

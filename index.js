@@ -2,9 +2,11 @@ import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import express from 'express';
+import https from 'https';
+import { readFileSync, writeFileSync } from 'fs';
 import querystring from 'querystring';
 import { Buffer } from 'buffer';
-import { writeFileSync } from 'fs';
+// writeFileSync already imported above
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -14,7 +16,10 @@ const __dirname = dirname(__filename);
 // Configuration
 const CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || 'YOUR_CLIENT_ID';
 const CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || 'YOUR_CLIENT_SECRET';
-const REDIRECT_URI = 'http://localhost:3000/callback';
+const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || 'https://127.0.0.1:3000/callback';
+const SSL_KEY_PATH = process.env.SSL_KEY_PATH || null;
+const SSL_CERT_PATH = process.env.SSL_CERT_PATH || null;
+const SSL_PASSPHRASE = process.env.SSL_PASSPHRASE || undefined;
 const START_PAGE = 1;
 const END_PAGE = 316;
 
@@ -129,9 +134,28 @@ async function refreshAccessToken() {
 function setupAuthServer() {
   return new Promise((resolve, reject) => {
     const app = express();
-    const server = app.listen(3000, () => {
-      console.log('🌐 Auth server listening on http://localhost:3000');
-    });
+    let server;
+
+    // Prepare HTTPS options
+    try {
+      if (!SSL_KEY_PATH || !SSL_CERT_PATH) {
+        throw new Error('Missing SSL key/cert. Set SSL_KEY_PATH and SSL_CERT_PATH env variables.');
+      }
+
+      const httpsOptions = {
+        key: readFileSync(SSL_KEY_PATH),
+        cert: readFileSync(SSL_CERT_PATH),
+        passphrase: SSL_PASSPHRASE
+      };
+
+      server = https.createServer(httpsOptions, app).listen(3000, () => {
+        console.log('🌐 Auth server listening on https://127.0.0.1:3000');
+      });
+    } catch (e) {
+      console.error('❌ HTTPS setup error:', e.message);
+      console.error('👉 Provide valid SSL cert/key via env: SSL_KEY_PATH, SSL_CERT_PATH.');
+      return reject(e);
+    }
 
     // Root endpoint - helpful message
     app.get('/', (req, res) => {
@@ -140,11 +164,11 @@ function setupAuthServer() {
           <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
             <h1>🎵 NoData Spotify Automation</h1>
             <p>To authenticate, please visit:</p>
-            <p><a href="/login" style="font-size: 18px; color: #1DB954;">http://localhost:3000/login</a></p>
+            <p><a href="/login" style="font-size: 18px; color: #1DB954;">https://127.0.0.1:3000/login</a></p>
             <p style="margin-top: 30px; color: #666;">If you're seeing this page after clicking authorize on Spotify,<br>
             there may be an issue with your Redirect URI configuration.</p>
             <p style="color: #666;">Make sure your Spotify app has the redirect URI set to:<br>
-            <code>http://localhost:3000/callback</code></p>
+            <code>https://127.0.0.1:3000/callback</code></p>
           </body>
         </html>
       `);
@@ -155,14 +179,20 @@ function setupAuthServer() {
       const state = generateRandomString(16);
       const scope = 'playlist-modify-public playlist-modify-private';
 
-      res.redirect('https://accounts.spotify.com/authorize?' +
+      const authorizeUrl = 'https://accounts.spotify.com/authorize?' +
         querystring.stringify({
           response_type: 'code',
           client_id: CLIENT_ID,
           scope: scope,
           redirect_uri: REDIRECT_URI,
           state: state
-        }));
+        });
+
+      console.log('\n🔎 Using redirect URI:', REDIRECT_URI);
+      console.log('🔗 Full authorize URL (for debugging):');
+      console.log('   ' + authorizeUrl + '\n');
+
+      res.redirect(authorizeUrl);
     });
 
     // Callback endpoint
@@ -233,7 +263,8 @@ function setupAuthServer() {
     // Start auth flow
     console.log('\n🔐 Starting authentication...');
     console.log('👉 Please open this URL in your browser:');
-    console.log('   http://localhost:3000/login\n');
+    console.log('   https://127.0.0.1:3000/login\n');
+    console.log('ℹ️ Expecting callback at:', REDIRECT_URI);
   });
 }
 

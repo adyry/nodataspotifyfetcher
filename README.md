@@ -29,7 +29,7 @@ npm install
 4. Fill in the app details:
    - App name: (e.g., "NoData Fetcher")
    - App description: (e.g., "Script to add albums to playlist")
-   - Redirect URI: `http://localhost:3000/callback`
+   - Redirect URI: `https://127.0.0.1:3000/callback`
 5. Save your app and note down the **Client ID** and **Client Secret**
 
 ### 2. Configure Environment Variables
@@ -85,8 +85,8 @@ npm start
 ### First Run - Authentication
 
 On the first run, the script will:
-1. Start a local authentication server on `http://localhost:3000`
-2. Display a URL to open in your browser: `http://localhost:3000/login`
+1. Start a local authentication server on `https://127.0.0.1:3000`
+2. Display a URL to open in your browser: `https://127.0.0.1:3000/login`
 3. Redirect you to Spotify to authorize the app
 4. After authorization, redirect you back and display a success message
 5. The script will automatically continue with the scraping process
@@ -121,7 +121,7 @@ The script will:
 
 🔐 Starting authentication...
 👉 Please open this URL in your browser:
-   http://localhost:3000/login
+   https://127.0.0.1:3000/login
 
 ✅ Authentication successful! Access token obtained.
 

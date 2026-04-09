@@ -3,7 +3,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import express from 'express';
 import https from 'https';
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import querystring from 'querystring';
 import { Buffer } from 'buffer';
 // writeFileSync already imported above
@@ -20,8 +20,9 @@ const REDIRECT_URI = process.env.SPOTIFY_REDIRECT_URI || 'https://127.0.0.1:3000
 const SSL_KEY_PATH = process.env.SSL_KEY_PATH || null;
 const SSL_CERT_PATH = process.env.SSL_CERT_PATH || null;
 const SSL_PASSPHRASE = process.env.SSL_PASSPHRASE || undefined;
-const START_PAGE = 1;
-const END_PAGE = 316;
+const START_PAGE = process.env.START_PAGE || 1;
+const END_PAGE = process.env.END_PAGE || 316;
+const NOT_FOUND_ALBUMS_FILE = process.env.NOT_FOUND_ALBUMS_FILE || 'not-found-albums.md';
 
 // Playlist IDs by genre
 const PLAYLISTS = {
@@ -47,8 +48,8 @@ let accessToken = null;
 let refreshToken = null;
 let tokenExpiryTime = null;
 
-// Track not found albums
-const notFoundAlbums = [];
+// Track not found albums in a deduplicated way across the current run
+const notFoundAlbums = new Map();
 
 // Track stats by genre
 const genreStats = {
@@ -72,6 +73,40 @@ const existingPlaylistTracks = {
 
 // Delay helper to avoid rate limiting
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function normalizeAlbumField(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getNotFoundAlbumKey({ artist, album, url }) {
+  return [
+    normalizeAlbumField(artist),
+    normalizeAlbumField(album),
+    normalizeAlbumField(url)
+  ].join('::');
+}
+
+function addNotFoundAlbum(entry) {
+  const key = getNotFoundAlbumKey(entry);
+  const existing = notFoundAlbums.get(key);
+
+  if (existing) {
+    const mergedTags = Array.from(new Set([...(existing.tags || []), ...(entry.tags || [])])).sort();
+    notFoundAlbums.set(key, {
+      ...existing,
+      ...entry,
+      tags: mergedTags,
+      playlist: existing.playlist || entry.playlist
+    });
+    return false;
+  }
+
+  notFoundAlbums.set(key, {
+    ...entry,
+    tags: Array.from(new Set(entry.tags || [])).sort()
+  });
+  return true;
+}
 
 // Generate random string for state parameter
 function generateRandomString(length) {
@@ -416,18 +451,18 @@ async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
     if (response.data.albums.items.length > 0) {
       const albumId = response.data.albums.items[0].id;
       console.log(`   ✓ Found: "${album}" by ${artist} (ID: ${albumId})`);
-      return albumId;
+      return { albumId, wasNewNotFound: false };
     } else {
       console.log(`   ✗ Not found: "${album}" by ${artist}`);
       // Track not found album
-      notFoundAlbums.push({
+      const wasNewNotFound = addNotFoundAlbum({
         artist,
         album,
         url: nodataUrl,
         tags,
         playlist
       });
-      return null;
+      return { albumId: null, wasNewNotFound };
     }
   } catch (error) {
     if (error.response?.status === 401) {
@@ -436,14 +471,14 @@ async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
     }
     console.error(`   ✗ Error searching for "${album}" by ${artist}:`, error.message);
     // Track error cases as not found too
-    notFoundAlbums.push({
+    const wasNewNotFound = addNotFoundAlbum({
       artist,
       album,
       url: nodataUrl,
       tags,
       playlist
     });
-    return null;
+    return { albumId: null, wasNewNotFound };
   }
 }
 
@@ -522,22 +557,30 @@ async function addTracksToPlaylist(trackUris, playlistId, playlistName) {
 
 // Save not found albums to markdown file
 function saveNotFoundAlbums() {
-  if (notFoundAlbums.length === 0) {
+  if (notFoundAlbums.size === 0) {
     return;
   }
 
-  const timestamp = new Date().toISOString().split('T')[0];
-  const filename = `not-found-albums-${timestamp}.md`;
+  const filename = NOT_FOUND_ALBUMS_FILE;
   const filepath = join(__dirname, filename);
+  const dedupedAlbums = Array.from(notFoundAlbums.values()).sort((a, b) => {
+    const playlistCompare = a.playlist.localeCompare(b.playlist);
+    if (playlistCompare !== 0) return playlistCompare;
+
+    const artistCompare = a.artist.localeCompare(b.artist);
+    if (artistCompare !== 0) return artistCompare;
+
+    return a.album.localeCompare(b.album);
+  });
 
   let content = `# Albums Not Found on Spotify\n\n`;
   content += `Generated: ${new Date().toLocaleString()}\n`;
-  content += `Total: ${notFoundAlbums.length} albums\n\n`;
+  content += `Total: ${dedupedAlbums.length} albums\n\n`;
   content += `---\n\n`;
 
   // Group by playlist
   const byPlaylist = {};
-  notFoundAlbums.forEach(album => {
+  dedupedAlbums.forEach(album => {
     if (!byPlaylist[album.playlist]) {
       byPlaylist[album.playlist] = [];
     }
@@ -562,6 +605,43 @@ function saveNotFoundAlbums() {
   }
 }
 
+function loadExistingNotFoundAlbums(filepath) {
+  if (!existsSync(filepath)) {
+    return;
+  }
+
+  try {
+    const content = readFileSync(filepath, 'utf-8');
+    let currentPlaylist = null;
+
+    for (const line of content.split('\n')) {
+      const playlistMatch = line.match(/^##\s+(.+?)\s+\(\d+\s+albums?\)$/);
+      if (playlistMatch) {
+        currentPlaylist = playlistMatch[1].trim();
+        continue;
+      }
+
+      const albumMatch = line.match(/^\d+\.\s+\[(.+?)\s+-\s+(.+?)\]\((.+?)\)(?:\s+\*\[(.+)\]\*)?$/);
+      if (!albumMatch || !currentPlaylist) {
+        continue;
+      }
+
+      const [, artist, album, url, tagsString] = albumMatch;
+      const tags = tagsString ? tagsString.split(',').map(tag => tag.trim()).filter(Boolean) : [];
+
+      addNotFoundAlbum({
+        artist,
+        album,
+        url,
+        tags,
+        playlist: currentPlaylist
+      });
+    }
+  } catch (error) {
+    console.error(`❌ Error loading existing not found albums:`, error.message);
+  }
+}
+
 // Main function
 async function main() {
   console.log('🎵 Starting NoData.tv to Spotify automation (Multi-Genre)');
@@ -578,6 +658,8 @@ async function main() {
   if (!accessToken) {
     await setupAuthServer();
   }
+
+  loadExistingNotFoundAlbums(join(__dirname, NOT_FOUND_ALBUMS_FILE));
   
   // Fetch existing tracks from all playlists
   await fetchAllPlaylistTracks();
@@ -601,12 +683,14 @@ async function main() {
       console.log(`   → Destination: ${playlist} playlist`);
       
       // Step 1: Search for album on Spotify
-      const albumId = await searchSpotifyAlbum(artist, album, url, tags, playlist);
+      const { albumId, wasNewNotFound } = await searchSpotifyAlbum(artist, album, url, tags, playlist);
       await delay(300); // Rate limiting delay
       
       if (!albumId) {
-        totalNotFound++;
-        genreStats[playlist].notFound++;
+        if (wasNewNotFound) {
+          totalNotFound++;
+          genreStats[playlist].notFound++;
+        }
         continue;
       }
       

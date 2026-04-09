@@ -72,9 +72,10 @@ SPOTIFY_PLAYLIST_REST=your_rest_playlist_id
 
 ### 4. Configure Script Settings (Optional)
 
-Edit `index.js` if needed:
+Set these in `.env` if needed:
 - `START_PAGE`: Starting page number (default: 1)
-- `END_PAGE`: Ending page number (default: 26)
+- `END_PAGE`: Ending page number (default: 316)
+- `NOT_FOUND_ALBUMS_FILE`: Markdown file used for the persistent deduplicated not-found list (default: `not-found-albums.md`)
 
 ## Usage
 
@@ -176,11 +177,12 @@ The script includes delays to avoid hitting Spotify's rate limits:
 
 ## Not Found Albums
 
-When albums aren't found on Spotify, the script automatically creates a markdown file (e.g., `not-found-albums-2025-11-09.md`) with:
+When albums aren't found on Spotify, the script automatically updates a single markdown file (default: `not-found-albums.md`) with:
 - Albums grouped by genre/playlist
 - Clickable links to each album's nodata.tv page
 - Artist and album name with tags
 - Total count of not found albums
+- Duplicate entries removed across runs
 
 Example format:
 ```markdown

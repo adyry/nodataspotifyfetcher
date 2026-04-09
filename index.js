@@ -50,6 +50,7 @@ let tokenExpiryTime = null;
 
 // Track not found albums in a deduplicated way across the current run
 const notFoundAlbums = new Map();
+let notFoundAlbumSeq = 0;
 
 // Track stats by genre
 const genreStats = {
@@ -96,16 +97,40 @@ function addNotFoundAlbum(entry) {
       ...existing,
       ...entry,
       tags: mergedTags,
-      playlist: existing.playlist || entry.playlist
+      playlist: existing.playlist || entry.playlist,
+      publishDate: existing.publishDate || entry.publishDate,
+      _seq: existing._seq
     });
     return false;
   }
 
   notFoundAlbums.set(key, {
     ...entry,
-    tags: Array.from(new Set(entry.tags || [])).sort()
+    tags: Array.from(new Set(entry.tags || [])).sort(),
+    _seq: ++notFoundAlbumSeq
   });
   return true;
+}
+
+function parseNodataPublishDate(text) {
+  if (!text) return null;
+  const cleaned = String(text).split('·')[0].trim();
+  const match = cleaned.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})$/);
+  if (!match) return null;
+
+  const [, mon, dayStr, yearStr] = match;
+  const monthIndex = {
+    Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+    Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11
+  }[mon];
+  if (monthIndex === undefined) return null;
+
+  const year = Number(yearStr);
+  const day = Number(dayStr);
+  const date = new Date(Date.UTC(year, monthIndex, day));
+
+  // Format as YYYY-MM-DD (UTC) for easy lexicographic sorting.
+  return date.toISOString().slice(0, 10);
 }
 
 // Generate random string for state parameter
@@ -408,6 +433,9 @@ async function fetchAlbumsFromPage(pageNumber) {
       const albumLink = $(element).find('> a').first();
       const text = albumLink.text().replace(/\[....\]/g, '').split('/ ');
       const href = albumLink.attr('href');
+
+      // Example: "Apr 07, 2026 · 1 comment"
+      const publishDate = parseNodataPublishDate($(element).find('p').last().text());
       
       // Get tags
       const tags = [];
@@ -422,7 +450,8 @@ async function fetchAlbumsFromPage(pageNumber) {
           album: text[1].trim(),
           url: href,
           tags: tags,
-          playlist: playlist
+          playlist: playlist,
+          publishDate
         });
       }
     });
@@ -436,7 +465,7 @@ async function fetchAlbumsFromPage(pageNumber) {
 }
 
 // Search for album on Spotify
-async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
+async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist, publishDate) {
   try {
     const token = await getAccessToken();
     const query = `artist:${artist} album:${album}`;
@@ -460,7 +489,8 @@ async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
         album,
         url: nodataUrl,
         tags,
-        playlist
+        playlist,
+        publishDate
       });
       return { albumId: null, wasNewNotFound };
     }
@@ -476,7 +506,8 @@ async function searchSpotifyAlbum(artist, album, nodataUrl, tags, playlist) {
       album,
       url: nodataUrl,
       tags,
-      playlist
+      playlist,
+      publishDate
     });
     return { albumId: null, wasNewNotFound };
   }
@@ -567,10 +598,12 @@ function saveNotFoundAlbums() {
     const playlistCompare = a.playlist.localeCompare(b.playlist);
     if (playlistCompare !== 0) return playlistCompare;
 
-    const artistCompare = a.artist.localeCompare(b.artist);
-    if (artistCompare !== 0) return artistCompare;
+    // Newest first within each playlist.
+    const dateA = a.publishDate || '';
+    const dateB = b.publishDate || '';
+    if (dateA !== dateB) return dateB.localeCompare(dateA);
 
-    return a.album.localeCompare(b.album);
+    return (a._seq || 0) - (b._seq || 0);
   });
 
   let content = `# Albums Not Found on Spotify\n\n`;
@@ -592,7 +625,8 @@ function saveNotFoundAlbums() {
     content += `## ${playlist} (${albums.length} albums)\n\n`;
     albums.forEach((album, index) => {
       const tagsStr = album.tags && album.tags.length > 0 ? ` *[${album.tags.join(', ')}]*` : '';
-      content += `${index + 1}. [${album.artist} - ${album.album}](${album.url})${tagsStr}\n`;
+      const dateStr = album.publishDate ? `${album.publishDate} - ` : '';
+      content += `${index + 1}. ${dateStr}[${album.artist} - ${album.album}](${album.url})${tagsStr}\n`;
     });
     content += `\n`;
   }
@@ -621,12 +655,12 @@ function loadExistingNotFoundAlbums(filepath) {
         continue;
       }
 
-      const albumMatch = line.match(/^\d+\.\s+\[(.+?)\s+-\s+(.+?)\]\((.+?)\)(?:\s+\*\[(.+)\]\*)?$/);
+      const albumMatch = line.match(/^\d+\.\s+(?:(\d{4}-\d{2}-\d{2})\s+-\s+)?\[(.+?)\s+-\s+(.+?)\]\((.+?)\)(?:\s+\*\[(.+)\]\*)?$/);
       if (!albumMatch || !currentPlaylist) {
         continue;
       }
 
-      const [, artist, album, url, tagsString] = albumMatch;
+      const [, publishDate, artist, album, url, tagsString] = albumMatch;
       const tags = tagsString ? tagsString.split(',').map(tag => tag.trim()).filter(Boolean) : [];
 
       addNotFoundAlbum({
@@ -634,7 +668,8 @@ function loadExistingNotFoundAlbums(filepath) {
         album,
         url,
         tags,
-        playlist: currentPlaylist
+        playlist: currentPlaylist,
+        publishDate: publishDate || null
       });
     }
   } catch (error) {
@@ -674,16 +709,17 @@ async function main() {
     const albums = await fetchAlbumsFromPage(page);
     
     // Process each album in reverse order
-    for (const { artist, album, url, tags, playlist } of albums.reverse()) {
+    for (const { artist, album, url, tags, playlist, publishDate } of albums.reverse()) {
       totalProcessed++;
       genreStats[playlist].processed++;
       
       const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : ' [no tags]';
-      console.log(`\n[${totalProcessed}] Processing: "${album}" by ${artist}${tagsStr}`);
+      const dateStr = publishDate ? ` (${publishDate})` : '';
+      console.log(`\n[${totalProcessed}] Processing: "${album}" by ${artist}${dateStr}${tagsStr}`);
       console.log(`   → Destination: ${playlist} playlist`);
       
       // Step 1: Search for album on Spotify
-      const { albumId, wasNewNotFound } = await searchSpotifyAlbum(artist, album, url, tags, playlist);
+      const { albumId, wasNewNotFound } = await searchSpotifyAlbum(artist, album, url, tags, playlist, publishDate);
       await delay(300); // Rate limiting delay
       
       if (!albumId) {
